@@ -2,7 +2,6 @@
 import os
 import asyncio
 import aiohttp
-import imghdr
 from tempfile import NamedTemporaryFile
 from io import BytesIO
 
@@ -32,9 +31,12 @@ openai.api_key = OPENAI_API_KEY
 
 pending_photos: dict[int, dict] = {}
 
-# ---- Вспомогательная логика для определения формата ----
+# ---- Вспомогательная логика для определения формата (без imghdr/pillow) ----
 def detect_ext_from_bytes(b: bytes, file_path_hint: str | None = None, content_type: str | None = None) -> str | None:
-    """Вернёт расширение файла: '.jpg' / '.png' / '.webp' или None если не удалось."""
+    """
+    Вернёт расширение файла ('.jpg' / '.png' / '.webp') или None, если не распознано.
+    Использует Content-Type, hint по пути, и сигнатуры байтов.
+    """
     if content_type:
         ct = content_type.lower()
         if "jpeg" in ct or "jpg" in ct:
@@ -44,7 +46,7 @@ def detect_ext_from_bytes(b: bytes, file_path_hint: str | None = None, content_t
         if "webp" in ct:
             return ".webp"
 
-    # по hint расширения в пути
+    # hint по пути (например file_path)
     if file_path_hint:
         _, ext = os.path.splitext(file_path_hint)
         ext = ext.lower()
@@ -55,24 +57,14 @@ def detect_ext_from_bytes(b: bytes, file_path_hint: str | None = None, content_t
         if ext == ".webp":
             return ".webp"
 
-    # используем imghdr для jpeg/png
-    kind = imghdr.what(None, h=b)
-    if kind == "jpeg":
-        return ".jpg"
-    if kind == "png":
-        return ".png"
-    if kind == "webp":
-        return ".webp"
-
-    # простая проверка сигнатуры WEBP (RIFF....WEBP)
-    if len(b) >= 12 and b[0:4] == b"RIFF" and b[8:12] == b"WEBP":
-        return ".webp"
-
-    # проверим сигнатуру JPEG/PNG вручную на всякий случай
+    # сигнатуры:
     if len(b) >= 2 and b[0:2] == b"\xff\xd8":
         return ".jpg"
     if len(b) >= 8 and b[0:8] == b"\x89PNG\r\n\x1a\n":
         return ".png"
+    # WEBP: RIFF....WEBP
+    if len(b) >= 12 and b[0:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return ".webp"
 
     return None
 
@@ -133,7 +125,7 @@ async def on_text(message: Message):
             tmp_in.write(image_bytes)
             tmp_in_path = tmp_in.name
 
-        # Отправляем изображение в OpenAI (старый интерфейс 0.28.0)
+        # Отправляем изображение в OpenAI (openai==0.28.0)
         with open(tmp_in_path, "rb") as img_file:
             result = openai.Image.create_edit(
                 image=img_file,
@@ -146,7 +138,6 @@ async def on_text(message: Message):
         # Парсим результат
         image_url = None
         if result and "data" in result and len(result["data"]) > 0:
-            # В старом API возвращается data[0].url
             image_url = result["data"][0].get("url")
 
         if not image_url:
@@ -155,7 +146,6 @@ async def on_text(message: Message):
         await bot.send_photo(chat_id=message.chat.id, photo=image_url, caption="✅ Готово!")
 
     except Exception as e:
-        # Показываем пользователю информативную ошибку
         await message.reply(f"⚠️ Ошибка: {e}")
 
     finally:
