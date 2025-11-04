@@ -1,18 +1,18 @@
 # main.py
 import os
 import asyncio
-import aiohttp
-from tempfile import NamedTemporaryFile
 from io import BytesIO
+from tempfile import NamedTemporaryFile
+
+import aiohttp
+from PIL import Image, UnidentifiedImageError
+from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message
 from aiogram.filters import Command
-from dotenv import load_dotenv
 
-import openai
-
-# ----------------- Загружаем .env -----------------
+# ----------------- Загрузка .env -----------------
 dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 load_dotenv(dotenv_path)
 
@@ -22,60 +22,85 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
     raise RuntimeError("Не найдены TELEGRAM_TOKEN или OPENAI_API_KEY в .env")
 
+# ----------------- Инициализация Telegram -----------------
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-openai.api_key = OPENAI_API_KEY
+# ----------------- Конфиг OpenAI endpoint -----------------
+OPENAI_IMAGES_EDIT_URL = "https://api.openai.com/v1/images/edits"
+OPENAI_HEADERS = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
+# ----------------- Словарь ожидающих фото -----------------
 pending_photos: dict[int, dict] = {}
 
-# ---- Вспомогательная логика для определения формата (без imghdr/pillow) ----
-def detect_ext_from_bytes(b: bytes, file_path_hint: str | None = None, content_type: str | None = None) -> str | None:
+# ----------------- Вспомогательные функции -----------------
+def prepare_image_bytes_for_openai(in_bytes: bytes, want_size: int = 1024) -> tuple[bytes, str]:
     """
-    Вернёт расширение файла ('.jpg' / '.png' / '.webp') или None, если не распознано.
-    Использует Content-Type, hint по пути, и сигнатуры байтов.
+    Открывает изображение через Pillow, конвертирует в RGB (если нужно),
+    обрезает по центру в квадрат и ресайзит до want_size x want_size.
+    Возвращает кортеж (bytes, mime_type) — bytes в формате PNG.
     """
-    if content_type:
-        ct = content_type.lower()
-        if "jpeg" in ct or "jpg" in ct:
-            return ".jpg"
-        if "png" in ct:
-            return ".png"
-        if "webp" in ct:
-            return ".webp"
+    try:
+        img = Image.open(BytesIO(in_bytes))
+    except UnidentifiedImageError:
+        raise ValueError("Формат изображения не распознан Pillow.")
 
-    # hint по пути (например file_path)
-    if file_path_hint:
-        _, ext = os.path.splitext(file_path_hint)
-        ext = ext.lower()
-        if ext in (".jpg", ".jpeg"):
-            return ".jpg"
-        if ext == ".png":
-            return ".png"
-        if ext == ".webp":
-            return ".webp"
+    # Convert to RGBA/RGB depending on presence of alpha
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGBA" if "A" in img.mode else "RGB")
 
-    # сигнатуры:
-    if len(b) >= 2 and b[0:2] == b"\xff\xd8":
-        return ".jpg"
-    if len(b) >= 8 and b[0:8] == b"\x89PNG\r\n\x1a\n":
-        return ".png"
-    # WEBP: RIFF....WEBP
-    if len(b) >= 12 and b[0:4] == b"RIFF" and b[8:12] == b"WEBP":
-        return ".webp"
+    # Crop to square (center) then resize
+    w, h = img.size
+    side = min(w, h)
+    left = (w - side) // 2
+    upper = (h - side) // 2
+    right = left + side
+    lower = upper + side
+    img = img.crop((left, upper, right, lower))
+    img = img.resize((want_size, want_size), Image.LANCZOS)
 
-    return None
+    # Save as PNG (PNG is safe; JPEG would lose alpha)
+    out = BytesIO()
+    img.save(out, format="PNG")
+    out_bytes = out.getvalue()
+    return out_bytes, "image/png"
+
+async def openai_images_edit_send(image_bytes: bytes, prompt: str, session: aiohttp.ClientSession):
+    """
+    Отправляет multipart POST к /v1/images/edits с image и prompt.
+    Возвращает dict JSON ответа.
+    """
+    form = aiohttp.FormData()
+    form.add_field("model", "gpt-image-1")
+    form.add_field("prompt", prompt)
+    form.add_field("size", "1024x1024")
+    # прикрепляем файл — даём имя и корректный content_type
+    form.add_field("image", image_bytes, filename="input.png", content_type="image/png")
+
+    # Для безопасности - явный таймаут
+    timeout = aiohttp.ClientTimeout(total=180)
+    async with session.post(OPENAI_IMAGES_EDIT_URL, headers=OPENAI_HEADERS, data=form, timeout=timeout) as resp:
+        text = await resp.text()
+        try:
+            js = await resp.json()
+        except Exception:
+            raise RuntimeError(f"OpenAI returned non-JSON response (status {resp.status}): {text}")
+        if resp.status >= 400:
+            # попробуем вернуть осмысленную ошибку из OpenAI, если есть
+            msg = js.get("error", {}).get("message") if isinstance(js, dict) else text
+            raise RuntimeError(f"OpenAI API error (status {resp.status}): {msg}")
+        return js
 
 # ----------------- Хэндлеры -----------------
 @router.message(Command(commands=["start", "help"]))
 async def cmd_start(message: Message):
     await message.reply(
         "👋 Привет! Я — фото-редактор.\n"
-        "1) Отправь фото\n"
-        "2) Затем пришли инструкцию, что сделать.\n\n"
-        "Поддерживаемые форматы: JPG/JPEG, PNG, WEBP."
+        "1) Отправь фото (JPG/PNG/WEBP/и т.п.)\n"
+        "2) Затем пришли текст — что с ним сделать.\n\n"
+        "Я автоматически подготовлю изображение (сквош/масштаб) и пришлю результат."
     )
 
 @router.message(F.photo)
@@ -96,64 +121,51 @@ async def on_text(message: Message):
 
     await message.reply("🪄 Обрабатываю изображение, это может занять несколько секунд...")
 
-    tmp_in_path = None
+    tmp_path = None
     try:
         # Получаем файл из Telegram
         file_obj = await bot.get_file(file_id)
-        file_path = file_obj.file_path  # hint с расширением иногда есть
+        file_path = file_obj.file_path
         file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
 
+        # Скачиваем оригинал
         async with aiohttp.ClientSession() as session:
             async with session.get(file_url) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"Ошибка скачивания файла: HTTP {resp.status}")
-                image_bytes = await resp.read()
-                content_type = (resp.headers.get("Content-Type") or "").lower()
+                orig_bytes = await resp.read()
+                # подготовим bytes (crop/resize/convert) для OpenAI
+                processed_bytes, mime = prepare_image_bytes_for_openai(orig_bytes, want_size=1024)
 
-        # Определяем расширение (jpg/png/webp)
-        ext = detect_ext_from_bytes(image_bytes, file_path_hint=file_path, content_type=content_type)
+            # Отправляем в OpenAI
+            result_json = await openai_images_edit_send(processed_bytes, prompt, session)
 
-        if not ext:
-            # Если не определили формат — сообщаем пользователю
-            await message.reply(
-                "Не удалось определить формат изображения. Пожалуйста, пришли фото в формате JPG/JPEG, PNG или WEBP."
-            )
+        # Разбор ответа: поддерживаем 'url' и 'b64_json'
+        image_data = None
+        if isinstance(result_json, dict) and "data" in result_json and len(result_json["data"]) > 0:
+            d0 = result_json["data"][0]
+            if "url" in d0 and d0["url"]:
+                image_url = d0["url"]
+                # просто пересылаем URL как фото
+                await bot.send_photo(chat_id=message.chat.id, photo=image_url, caption="✅ Готово!")
+                return
+            elif "b64_json" in d0 and d0["b64_json"]:
+                import base64
+                raw = base64.b64decode(d0["b64_json"])
+                image_data = raw
+
+        if image_data:
+            await bot.send_photo(chat_id=message.chat.id, photo=BytesIO(image_data), caption="✅ Готово!")
             return
 
-        # Сохраняем временный файл с правильным расширением
-        with NamedTemporaryFile(suffix=ext, delete=False) as tmp_in:
-            tmp_in.write(image_bytes)
-            tmp_in_path = tmp_in.name
-
-        # Отправляем изображение в OpenAI (openai==0.28.0)
-        with open(tmp_in_path, "rb") as img_file:
-            result = openai.Image.create_edit(
-                image=img_file,
-                prompt=prompt,
-                n=1,
-                size="1024x1024",
-                model="gpt-image-1"
-            )
-
-        # Парсим результат
-        image_url = None
-        if result and "data" in result and len(result["data"]) > 0:
-            image_url = result["data"][0].get("url")
-
-        if not image_url:
-            raise RuntimeError("Не удалось получить URL результата от OpenAI.")
-
-        await bot.send_photo(chat_id=message.chat.id, photo=image_url, caption="✅ Готово!")
+        raise RuntimeError("Не удалось извлечь изображение из ответа OpenAI.")
 
     except Exception as e:
-        await message.reply(f"⚠️ Ошибка: {e}")
-
-    finally:
-        try:
-            if tmp_in_path and os.path.exists(tmp_in_path):
-                os.remove(tmp_in_path)
-        except Exception:
-            pass
+        # Если ответ OpenAI говорит о региональной блокировке, выдаём понятное сообщение
+        msg = str(e)
+        if "Country, region, or territory not supported" in msg or "not supported" in msg:
+            msg += "\n\nПохоже, ваш аккаунт/регион не поддерживаются OpenAI Images API — это проблема учётной записи. Попробуйте использовать VPN/другую учётную запись OpenAI или Azure OpenAI (если доступно), или свяжитесь с поддержкой OpenAI."
+        await message.reply(f"⚠️ Ошибка: {msg}")
 
 # ----------------- Запуск -----------------
 async def main():
